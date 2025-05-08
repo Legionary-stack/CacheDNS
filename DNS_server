@@ -1,0 +1,309 @@
+import socket
+import struct
+import time
+import pickle
+import threading
+import logging
+from datetime import datetime
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+
+class DNSServer:
+    RECORD_TYPES = {
+        1: 'A',
+        2: 'NS',
+        12: 'PTR',
+        28: 'AAAA'
+    }
+
+    def __init__(self, host='127.0.0.1', port=53):
+        self.host = host
+        self.port = port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind((host, port))
+
+        self.dns_cache = {
+            'A': {},
+            'AAAA': {},
+            'NS': {},
+            'PTR': {}
+        }
+
+        self.load_cache()
+
+        self.cleanup_thread = threading.Thread(target=self.cleanup_cache)
+        self.cleanup_thread.daemon = True
+        self.cleanup_thread.start()
+
+        logging.info(f"DNS Server started on {host}:{port}")
+
+    def parse_domain_name(self, data, offset):
+        """Парсинг доменного имени из DNS-пакета"""
+        domain_parts = []
+        while True:
+            length = data[offset]
+            if length == 0:
+                offset += 1
+                break
+            elif length & 0xC0 == 0xC0:
+                pointer = struct.unpack('!H', data[offset:offset + 2])[0] & 0x3FFF
+                domain_parts.extend(self.parse_domain_name(data, pointer)[0].split('.'))
+                offset += 2
+                break
+            else:
+                offset += 1
+                domain_parts.append(data[offset:offset + length].decode())
+                offset += length
+        return '.'.join(domain_parts), offset
+
+    def parse_dns_packet(self, data):
+        """Парсинг DNS-пакета"""
+        try:
+            header = struct.unpack('!6H', data[:12])
+            query = {
+                'id': header[0],
+                'flags': header[1],
+                'qdcount': header[2],
+                'ancount': header[3],
+                'nscount': header[4],
+                'arcount': header[5]
+            }
+
+            offset = 12
+            qname, offset = self.parse_domain_name(data, offset)
+            qtype, qclass = struct.unpack('!HH', data[offset:offset + 4])
+
+            query.update({
+                'qname': qname,
+                'qtype': qtype,
+                'qclass': qclass
+            })
+
+            return query, offset + 4
+        except Exception as e:
+            logging.error(f"Error parsing DNS packet: {e}")
+            return None, None
+
+    def parse_resource_record(self, data, offset):
+        """Парсинг ресурсной записи"""
+        try:
+            name, offset = self.parse_domain_name(data, offset)
+            rtype, rclass, ttl, rdlength = struct.unpack('!HHIH', data[offset:offset + 10])
+            offset += 10
+
+            rdata = None
+            if rtype in self.RECORD_TYPES:
+                if self.RECORD_TYPES[rtype] in ['A', 'AAAA']:
+                    if rtype == 1:  # A record
+                        rdata = socket.inet_ntoa(data[offset:offset + rdlength])
+                    else:  # AAAA record
+                        rdata = socket.inet_ntop(socket.AF_INET6, data[offset:offset + rdlength])
+                elif self.RECORD_TYPES[rtype] in ['NS', 'PTR']:
+                    rdata, _ = self.parse_domain_name(data, offset)
+
+            return {
+                'name': name,
+                'type': self.RECORD_TYPES.get(rtype, rtype),
+                'class': rclass,
+                'ttl': ttl,
+                'rdlength': rdlength,
+                'rdata': rdata
+            }, offset + rdlength
+        except Exception as e:
+            logging.error(f"Error parsing resource record: {e}")
+            return None, offset
+
+    def parse_dns_response(self, data):
+        """Парсинг DNS-ответа"""
+        query, offset = self.parse_dns_packet(data)
+        if not query:
+            return None
+
+        response = {'query': query, 'answers': [], 'authority': [], 'additional': []}
+
+        for _ in range(query['ancount']):
+            record, offset = self.parse_resource_record(data, offset)
+            if record:
+                response['answers'].append(record)
+
+        for _ in range(query['nscount']):
+            record, offset = self.parse_resource_record(data, offset)
+            if record:
+                response['authority'].append(record)
+
+        for _ in range(query['arcount']):
+            record, offset = self.parse_resource_record(data, offset)
+            if record:
+                response['additional'].append(record)
+
+        return response
+
+    def update_cache(self, records, section_type='answers'):
+        """Обновление кэша новыми записями"""
+        current_time = time.time()
+
+        for record in records:
+            if record['type'] in self.dns_cache:
+                cache_key = record['name']
+                cache_data = {
+                    'rdata': record['rdata'],
+                    'ttl': current_time + record['ttl'],
+                    'section': section_type
+                }
+                self.dns_cache[record['type']][cache_key] = cache_data
+                logging.info(f"Added to cache: {record['type']} record for {cache_key}")
+
+    def handle_request(self):
+        """Обработка DNS-запросов"""
+        while True:
+            try:
+                data, addr = self.socket.recvfrom(512)
+                query, _ = self.parse_dns_packet(data)
+
+                if not query:
+                    continue
+
+                qtype = self.RECORD_TYPES.get(query['qtype'])
+                logging.info(f"Received query for {query['qname']} of type {qtype}")
+
+                if qtype and query['qname'] in self.dns_cache[qtype]:
+                    cached_record = self.dns_cache[qtype][query['qname']]
+                    if time.time() < cached_record['ttl']:
+                        logging.info(f"Cache hit for {query['qname']} ({qtype})")
+                        response = self.create_response(data, cached_record['rdata'])
+                        if response:
+                            self.socket.sendto(response, addr)
+                        continue
+
+                try:
+                    upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    upstream_socket.settimeout(5)
+                    upstream_socket.sendto(data, ('8.8.8.8', 53))
+                    response_data, _ = upstream_socket.recvfrom(512)
+
+                    response = self.parse_dns_response(response_data)
+                    if response:
+                        self.update_cache(response['answers'], 'answers')
+                        self.update_cache(response['authority'], 'authority')
+                        self.update_cache(response['additional'], 'additional')
+
+                    self.socket.sendto(response_data, addr)
+                except socket.timeout:
+                    logging.warning("Upstream DNS timeout")
+                    response = self.create_response(data)
+                    if response:
+                        self.socket.sendto(response, addr)
+                finally:
+                    upstream_socket.close()
+
+            except Exception as e:
+                logging.error(f"Error handling request: {e}")
+
+    def create_response(self, query_data, rdata='8.8.8.8'):
+        """Создание DNS-ответа"""
+        try:
+            query, _ = self.parse_dns_packet(query_data)
+            if not query:
+                return None
+
+            response = struct.pack('!H', query['id'])  # ID
+            response += struct.pack('!H', 0x8180)  # Флаги
+            response += struct.pack('!H', 1)  # QDCOUNT
+            response += struct.pack('!H', 1)  # ANCOUNT
+            response += struct.pack('!H', 0)  # NSCOUNT
+            response += struct.pack('!H', 0)  # ARCOUNT
+
+            response += query_data[12:]
+
+            # Секция ответа
+            response += struct.pack('!H', 0xC00C)  # Сжатое имя
+            response += struct.pack('!H', query['qtype'])  # Тип записи из запроса
+            response += struct.pack('!H', 1)  # Класс IN
+            response += struct.pack('!L', 300)  # TTL
+
+            if query['qtype'] == 1:  # A
+                response += struct.pack('!H', 4)  # Длина данных
+                response += socket.inet_aton(rdata)  # IP-адрес
+            elif query['qtype'] == 28:  # AAAA
+                response += struct.pack('!H', 16)  # Длина данных
+                response += socket.inet_pton(socket.AF_INET6, rdata)
+            elif query['qtype'] in [2, 12]:  # NS или PTR
+                domain_parts = rdata.split('.')
+                rdata_bytes = b''
+                for part in domain_parts:
+                    rdata_bytes += bytes([len(part)]) + part.encode()
+                rdata_bytes += b'\x00'
+                response += struct.pack('!H', len(rdata_bytes))
+                response += rdata_bytes
+
+            return response
+        except Exception as e:
+            logging.error(f"Error creating response: {e}")
+            return None
+
+    def cleanup_cache(self):
+        """Очистка устаревших записей кэша"""
+        while True:
+            current_time = time.time()
+            for record_type in self.dns_cache:
+                for domain in list(self.dns_cache[record_type].keys()):
+                    if current_time > self.dns_cache[record_type][domain]['ttl']:
+                        del self.dns_cache[record_type][domain]
+                        logging.info(f"Removed expired record: {record_type} {domain}")
+            time.sleep(60)
+
+    def save_cache(self):
+        """Сохранение кэша на диск"""
+        try:
+            with open('dns_cache.pkl', 'wb') as f:
+                pickle.dump(self.dns_cache, f)
+            logging.info("Cache saved to disk")
+        except Exception as e:
+            logging.error(f"Error saving cache: {e}")
+
+    def load_cache(self):
+        """Загрузка кэша с диска"""
+        try:
+            with open('dns_cache.pkl', 'rb') as f:
+                self.dns_cache = pickle.load(f)
+            logging.info("Cache loaded from disk")
+        except FileNotFoundError:
+            logging.info("No cache file found, starting with empty cache")
+        except Exception as e:
+            logging.error(f"Error loading cache: {e}")
+
+    def print_cache(self):
+        """Вывод содержимого кэша"""
+        print("\nТекущее содержимое кэша:")
+        print("=" * 60)
+        for record_type in self.dns_cache:
+            if self.dns_cache[record_type]:
+                print(f"\nЗаписи типа {record_type}:")
+                print("-" * 40)
+                for domain, data in self.dns_cache[record_type].items():
+                    expires = datetime.fromtimestamp(data['ttl']).strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"Домен: {domain}")
+                    print(f"Данные: {data['rdata']}")
+                    print(f"Истекает: {expires}")
+                    print(f"Секция: {data['section']}")
+                    print("-" * 40)
+
+
+if __name__ == "__main__":
+    server = DNSServer()
+
+    server_thread = threading.Thread(target=server.handle_request)
+    server_thread.daemon = True
+    server_thread.start()
+
+    try:
+        while True:
+            server.print_cache()
+            time.sleep(10)
+    except KeyboardInterrupt:
+        logging.info("Server shutting down...")
+        server.save_cache()
